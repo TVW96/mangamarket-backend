@@ -8,7 +8,19 @@ set -euo pipefail
 parity_tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$parity_tmp_dir"' EXIT
 
-shared_tables="'profiles','user_roles','catalog_products','inventory_items','listings','listing_items','media_assets'"
+shared_tables="'profiles','user_roles','catalog_products','inventory_items','listings','listing_contributors','listing_items','media_assets'"
+
+enums_query="
+select
+  t.typname,
+  e.enumsortorder,
+  e.enumlabel
+from pg_type t
+join pg_enum e on e.enumtypid = t.oid
+join pg_namespace n on n.oid = t.typnamespace
+where n.nspname = 'public'
+order by t.typname, e.enumsortorder;
+"
 
 columns_query="
 select
@@ -50,15 +62,45 @@ order by tablename, indexname;
 
 triggers_query="
 select
-  event_object_table,
-  trigger_name,
-  event_manipulation,
-  action_timing,
-  action_statement
-from information_schema.triggers
-where trigger_schema = 'public'
-  and event_object_table in (${shared_tables})
-order by event_object_table, trigger_name, event_manipulation;
+  c.relname,
+  tr.tgname,
+  tr.tgdeferrable,
+  tr.tginitdeferred,
+  pg_get_triggerdef(tr.oid, true)
+from pg_trigger tr
+join pg_class c on c.oid = tr.tgrelid
+join pg_namespace n on n.oid = c.relnamespace
+where not tr.tgisinternal
+  and n.nspname = 'public'
+  and c.relname in (${shared_tables})
+order by c.relname, tr.tgname;
+"
+
+routines_query="
+with shared_trigger_functions as (
+  select distinct tr.tgfoid
+  from pg_trigger tr
+  join pg_class c on c.oid = tr.tgrelid
+  join pg_namespace n on n.oid = c.relnamespace
+  where not tr.tgisinternal
+    and n.nspname = 'public'
+    and c.relname in (${shared_tables})
+)
+select
+  p.proname,
+  pg_get_function_identity_arguments(p.oid),
+  pg_get_functiondef(p.oid)
+from pg_proc p
+join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'public'
+  and (
+    p.oid in (select tgfoid from shared_trigger_functions)
+    or p.proname in (
+      'lock_collaborative_listing_set',
+      'validate_collaborative_listing'
+    )
+  )
+order by p.proname, pg_get_function_identity_arguments(p.oid);
 "
 
 compare_query() {
@@ -75,9 +117,11 @@ compare_query() {
     "$parity_tmp_dir/supabase-${label}.txt"
 }
 
+compare_query enums "$enums_query"
 compare_query columns "$columns_query"
 compare_query constraints "$constraints_query"
 compare_query indexes "$indexes_query"
 compare_query triggers "$triggers_query"
+compare_query routines "$routines_query"
 
 echo "Shared MangaMarketplace schemas match."
